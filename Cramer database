@@ -1,0 +1,15 @@
+SELECT 
+(CASE WHEN (TAL is not null and "UEVT-Node" is not null) THEN 
+     CONCAT(SPLIT_PART(TAL,'/',1), '/', 
+            CASE WHEN (SUBSTRING("UEVT-Node",1,5)='1-MFG') THEN 
+                       TRIM (LEADING '0' FROM SPLIT_PART(SPLIT_PART("UEVT-Node",' ',3),'/',1)) 
+            ELSE 
+                       TRIM (LEADING '0' FROM SPLIT_PART("UEVT-Node",'-',2)) END, '/', 
+            CASE WHEN (SUBSTRING("UEVT-Node",1,5)='1-MFG') THEN 
+                       TRIM (LEADING '0' FROM SPLIT_PART(SPLIT_PART("UEVT-Node",' ',3),'/',1)) 
+            ELSE 
+                       TRIM (LEADING '0' FROM SPLIT_PART("UEVT-Node",'-',2)) END, '/', 
+            TRIM (LEADING '0' FROM SPLIT_PART(TAL,'/',4))) 
+     ELSE null 
+END ) as "Cramer.LSZ_normiert" 
+FROM public."RAW_SAT_TASI_CRAMER"
