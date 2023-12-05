@@ -1,0 +1,518 @@
+
+ .set errorlevel unknown severity 99
+.SET MAXERROR 1
+
+-- global login file:
+.RUN FILE "btq_logon_fenterp1.sql"
+
+
+select current_timestamp(0), 'Start PICASSO_AIDA_CCB_MATCH.sql'; 
+
+
+-------------------------------------------------------------------------------
+-- PREP: Create Table with alle Routers that are not really documented as routers in CCB but as "ANSCHLUSSKENNUNG" or "DIAL IN" (yes, that happens) --
+-------------------------------------------------------------------------------
+
+.set errorlevel 3807 severity 0
+drop table UDB138.PICASSO_CCB_DIALIN;
+.set errorlevel 3807 severity 8
+
+create TABLE UDB138.PICASSO_CCB_DIALIN AS 
+(
+select SUBSCRIPTION_ID, ROUTERNAME, SERVICE_CHARACTERISTIC_NAME, LOADTM 
+from
+(
+select
+distinct  
+an.subscription_id
+, dts.product_subscription_id
+, dts.PRODUCT_CODE
+,  dts.service_code 
+, ssu.SERVICE_NAME
+, an.access_method_id as ROUTERNAME
+, service_char_code+
+, service_characteristic_name
+, an.valid_from
+, an.valid_until
+, la.city_name
+, la.postal_code
+, la.street_name
+, la.street_number
+, dts.SERVICE_STATUS_CODE
+, ccd.customer_number
+, ccd.PARTY_NAME as CUSTOMER_NAME
+,COALESCE(ccd_TOP.CUSTOMER_NUMBER, ccd.CUSTOMER_NUMBER)  AS TOP_CUSTOMER_NUMBER
+,COALESCE(CCD_TOP.PARTY_NAME, CCD.PARTY_NAME )  AS TOP_CUSTOMER_NAME
+, current_timestamp as LOADTM
+from bi_data.wln_dv_subscription_derived dts
+inner join bi_data.WLN_DV_ACCESS_METHOD an 
+	on dts.subscription_id = an.subscription_id 
+	and DATE between an.VALID_FROM and an.valid_until
+inner join BI_DATA.WLN_DV_SUBSCRIPTION ssu
+on ssu.SUBSCRIPTION_ID = dts.subscription_id
+	and date between ssu.valid_from  and ssu.VALID_UNTIL
+	inner join SERVICE_CHARACTERISTIC sc
+	on service_characteristic_code = service_char_code
+
+left join bi_data.WLN_DV_CUSTOMER_CURR cu
+	on dts.customer_number = cu.customer_number
+left join dwh_arcordwh_prd.dt_location_address la
+on an.subscription_id = la.service_subscription_id
+
+
+LEFT OUTER JOIN BI_DATA.WLN_DV_CUSTOMER_CONTACT_DETAIL CCD
+    ON cu.CUSTOMER_NUMBER = CCD.CUSTOMER_NUMBER
+    AND CCD.ADDRESS_TYPE_CODE = 'PK'
+    
+   
+LEFT OUTER JOIN BI_DATA.WLN_DV_CUSTOMER_CONTACT_DETAIL CCD_TOP
+    ON cu.TOP_CUSTOMER_NUMBER = CCD_TOP.CUSTOMER_NUMBER
+    AND CCD_TOP.ADDRESS_TYPE_CODE = 'PK'
+
+where
+(upper(service_characteristic_name) like any ('DIAL%', 'ANSCHLUSSKENNUNG%','%ROUTER%NAME%') or (upper(service_characteristic_name) = 'LAYER 2 DIENSTEKENNUNG' and upper(left(an.access_method_id,1)) = 'S'))
+and not (left(an.access_method_id,2) = 'ar' and to_number(right(left(an.access_method_id,3),1)) is not null)
+and not left(an.access_method_id,2) = 'vb'
+and not left(an.access_method_id,2) = 'vk'
+and not left(an.access_method_id,2) = 'ab'
+and not left(an.access_method_id,2) = 'ak'
+and not left(an.access_method_id,2) = 'vf'
+and not left(an.access_method_id,2) = 'vs'
+and not (left(an.access_method_id,2) = 'bi' and to_number(right(left(an.access_method_id,3),1)) is not null)
+and not left(an.access_method_id,3)='+49'
+and not trim(an.access_method_id) in ('**NULL**', '-','','.','/','0') and not trim(an.access_method_id) is null
+) a
+UNION
+SELECT	a.SERVICE_SUBSCRIPTION_ID as SUBSCRIPTION_ID
+, CONFIGURED_VALUE_STRING as ROUTERNAME
+, SERVICE_CHARACTERISTIC_NAME
+, current_timestamp as LOADTM
+FROM	(select * from DWH_ARCORDWH_PRD.DT_SERVICE_NOT_FINAL where service_subscription_status<>'CANCELED') a
+left join DWH_ARCORDWH_PRD.CONF_SERV_CHARACTERISTIC b on a.SERVICE_SUBSCRIPTION_ID = b.SERVICE_SUBSCRIPTION_ID
+left join DWH_ARCORDWH_PRD.SERVICE_CHARACTERISTIC c on b.SERVICE_CHARACTERISTIC_CODE = c.SERVICE_CHAR_CODE
+left join DWH_ARCORDWH_PRD.CONFIGURED_VALUE d on b.CONFIG_SERVICE_CHAR_ID = d.CONFIG_SERVICE_CHAR_ID
+where (upper(c.service_characteristic_name) like any ('DIAL%', 'ANSCHLUSSKENNUNG%','%ROUTER%NAME%') or (upper(c.service_characteristic_name) = 'LAYER 2 DIENSTEKENNUNG')) -- and upper(left(an.access_method_id,1)) = 'S')
+and d.CONFIGURED_VALUE_STRING is not null and d.CONFIGURED_VALUE_STRING not in ('kein Dial-Out','ohne Dial up','bitte auswählen','x','mit Dial up (Frame/ATM/LC)','Dial-Out')
+and not (left(d.CONFIGURED_VALUE_STRING,2) = 'ar' and to_number(right(left(d.CONFIGURED_VALUE_STRING,3),1)) is not null)
+and not (left(d.CONFIGURED_VALUE_STRING,2) = 'bi' and to_number(right(left(d.CONFIGURED_VALUE_STRING,3),1)) is not null)
+)
+WITH DATA
+PRIMARY INDEX (SUBSCRIPTION_ID, ROUTERNAME);
+----------------------------------------------------
+-- PREP: Get all ROUTERNAMES from AIDA and match SERSU
+----------------------------------------------------
+.set errorlevel 3807 severity 0
+drop table VT_PICASSO_AIDAROUTER_TMP;
+.set errorlevel 3807 severity 8
+
+
+
+create VOLATILE TABLE  VT_PICASSO_AIDAROUTER_TMP AS
+(
+SELECT distinct	CPE.ROUTERNAME
+	, ROUT3.ROUTERNAME as ROUTERNAME_CCB
+	,ROUT3.SUBSCRIPTION_ID as SUBSCRIPTION_ID
+	, 'CPE' as MatchType
+	,CASE
+		when CPE.SERVICE_SUBSCRIPTION is not null then lpad(CPE.SERVICE_SUBSCRIPTION, 16, '0')
+	end as SERVICE_SUBSCRIPTION
+	,service_characteristic_name AS CCBMATCH_ROUTER_DIALIN
+	,CPE.PARENT_ROUTERNAME as PARENT_ROUTERNAME
+
+FROM (SELECT ROUTERNAME as ROUTERNAME, PARENT_ROUTERNAME as PARENT_ROUTERNAME, SERVICE_SUBSCRIPTION as SERVICE_SUBSCRIPTION FROM UDB138.AIDA_CPE) CPE
+
+left join UDB138.PICASSO_CCB_DIALIN ROUT3 on 
+(
+(trim(lower(ROUT3.ROUTERNAME )) like concat('%',trim(lower(cpe.ROUTERNAME)),'%')) and  
+
+
+not 
+(REGEXP_SIMILAR
+(trim(lower(ROUT3.ROUTERNAME )), concat(trim(lower(cpe.ROUTERNAME)),'[0-9]+'))
+=1
+or
+REGEXP_SIMILAR
+(trim(lower(ROUT3.ROUTERNAME )), concat(trim(lower(cpe.ROUTERNAME)),'[0-9]++'))
+=1
+OR
+REGEXP_SIMILAR
+(trim(lower(ROUT3.ROUTERNAME )), concat(trim(lower(cpe.ROUTERNAME)),'[0-9]+++'))
+=1
+) 
+
+or 
+(
+(trim(lower(ROUT3.ROUTERNAME )) like concat('%',trim(lower(cpe.PARENT_ROUTERNAME)),'%')) and
+not REGEXP_SIMILAR(trim(lower(ROUT3.ROUTERNAME )), concat(trim(lower(cpe.PARENT_ROUTERNAME)),'[0-9]+'))=1
+)
+
+union
+
+SELECT 	distinct DMD.ROUTERNAME
+	, ROUT3.ROUTERNAME as ROUTERNAME_CCB
+	, ROUT3.SUBSCRIPTION_ID as SUBSCRIPTION_ID
+	, 'DMD' as MatchType
+	,CASE
+		when DMD.SERVICE_SUBSCRIPTION is not null then lpad(DMD.SERVICE_SUBSCRIPTION, 16, '0')
+	end as SERVICE_SUBSCRIPTION
+	,ROUT3.service_characteristic_name AS CCBMATCH_ROUTER_DIALIN
+	,'' as PARENT_ROUTERNAME
+
+FROM (SELECT DEVICENAME as ROUTERNAME, '' as PARENT_ROUTERNAME, '' as SERVICE_SUBSCRIPTION from UDB138.AIDA_DMD where DEVICENAME is not in (SELECT 	distinct DMD.ROUTERNAME as DEVICENAME
+FROM (SELECT a.DEVICENAME as ROUTERNAME, b.TASI, '' as PARENT_ROUTERNAME, '' as SERVICE_SUBSCRIPTION from UDB138.AIDA_DMD a left join UDB138.PICASSO_AIDA_DMD_TASI b on a.DEVICENAME=b.ROUTERNAME) DMD
+left join UDB138.PICASSO_CCB_DIALIN ROUT5 on DMD.TASI = ROUT5.ROUTERNAME where SUBSCRIPTION_ID is not null) and DEVICENAME<>'000005') DMD
+left join UDB138.PICASSO_CCB_DIALIN ROUT3 on (
+(trim(lower(ROUT3.ROUTERNAME )) like concat('%',trim(lower(DMD.ROUTERNAME)),'%')) and  
+not REGEXP_SIMILAR(trim(lower(ROUT3.ROUTERNAME )), concat(trim(lower(DMD.ROUTERNAME)),'[0-9]+'))=1
+) 
+
+union
+
+SELECT 	distinct DMD.ROUTERNAME
+	,ROUT5.ROUTERNAME as ROUTERNAME_CCB
+	,ROUT5.SUBSCRIPTION_ID as SUBSCRIPTION_ID
+	, 'DMD' as MatchType
+	,CASE
+		when DMD.SERVICE_SUBSCRIPTION is not null and DMD.SERVICE_SUBSCRIPTION <> '' then lpad(DMD.SERVICE_SUBSCRIPTION, 16, '0')
+	end as SERVICE_SUBSCRIPTION
+	,ROUT5.service_characteristic_name AS CCBMATCH_ROUTER_DIALIN
+	,'' as PARENT_ROUTERNAME
+
+FROM (SELECT a.DEVICENAME as ROUTERNAME, b.TASI, '' as PARENT_ROUTERNAME, '' as SERVICE_SUBSCRIPTION from UDB138.AIDA_DMD a left join UDB138.PICASSO_AIDA_DMD_TASI b on a.DEVICENAME=b.ROUTERNAME where DEVICENAME<>'000005') DMD
+left join UDB138.PICASSO_CCB_DIALIN ROUT5 on DMD.TASI = ROUT5.ROUTERNAME
+
+union
+
+
+SELECT * from
+
+(SELECT 	distinct SRV.ROUTERNAME
+	,ROUT4.ROUTERNAME as ROUTERNAME_CCB
+	,ROUT4.SUBSCRIPTION_ID as SUBSCRIPTION_ID
+	, 'SRV' as MatchType
+	,CASE
+		when SRV.SERVICE_SUBSCRIPTION <> '' then lpad(SRV.SERVICE_SUBSCRIPTION, 16, '0')
+	end as SERVICE_SUBSCRIPTION
+	,service_characteristic_name AS CCBMATCH_ROUTER_DIALIN
+	,'' as PARENT_ROUTERNAME
+
+FROM (SELECT KENNUNG as ROUTERNAME, '' as PARENT_ROUTERNAME, '' as SERVICE_SUBSCRIPTION from udb138.AIDA_SERVER where ROUTERNAME is not null) SRV
+left join UDB138.PICASSO_CCB_DIALIN ROUT4 on (
+(trim(lower(ROUT4.ROUTERNAME )) like concat('%',trim(lower(SRV.ROUTERNAME)),'%')) 
+--and  not REGEXP_SIMILAR(trim(lower(ROUT4.ROUTERNAME )), concat(trim(lower(SRV.ROUTERNAME)),'[0-9]+'))=1
+)) b
+WHERE ROUTERNAME_CCB is not null and ROUTERNAME not in ('DC1', 'DC2', 'TEST', 'GW', 'FW', 'NMB', 'USV', 'Gateway', '???')
+--WHERE ROUTERNAME_CCB not is null
+
+--SELECT	ID, ACCOUNT_NO
+--FROM	udb138.PICASSO_AIDA_AAA
+union
+
+SELECT 	distinct AAA.ROUTERNAME
+	,ROUT3.ROUTERNAME as ROUTERNAME_CCB
+	,ROUT3.SUBSCRIPTION_ID as SUBSCRIPTION_ID
+	, 'AAA' as MatchType
+	,'' as SERVICE_SUBSCRIPTION
+	,service_characteristic_name AS CCBMATCH_ROUTER_DIALIN
+	,'' as PARENT_ROUTERNAME
+
+FROM (SELECT ACCOUNT_NO as ROUTERNAME, '' as PARENT_ROUTERNAME, '' as SERVICE_SUBSCRIPTION from UDB138.PICASSO_AIDA_AAA) AAA
+left join UDB138.PICASSO_CCB_DIALIN ROUT3 on (
+(trim(lower(ROUT3.ROUTERNAME )) like concat('%',trim(lower(AAA.ROUTERNAME)),'%')) and  
+not REGEXP_SIMILAR(trim(lower(ROUT3.ROUTERNAME )), concat(trim(lower(AAA.ROUTERNAME)),'[0-9]+'))=1
+)
+
+)
+
+
+
+WITH DATA
+--PRIMARY INDEX (SERVICE_SUBSCRIPTION_ID)
+ON COMMIT PRESERVE ROWS;
+ 
+select current_timestamp(0), count(1) || ' records extracted to VT_PICASSO_AIDAROUTER_TMP' from VT_PICASSO_AIDAROUTER_TMP; 
+ 
+----------------------------------------------------
+-- Select all combination from ROUTER and SERSU and 
+-- calc error cases
+----------------------------------------------------
+.set errorlevel 3807 severity 0
+drop table UDB138.PICASSO_AIDA_CCB_MATCH_TMP;
+.set errorlevel 3807 severity 8
+
+Create TABLE UDB138.PICASSO_AIDA_CCB_MATCH_TMP as (
+SELECT 
+	a.ROUTERNAME
+	, a.ROUTERNAME_CCB
+	, ssu.SUBSCRIPTION_ID as SERVICE_SUBSCRIPTION_ID_CCB  
+	, ssu.PARENT_SUBSCRIPTION_ID  as  PARENT_SERVICE_SUBSCRIPTION_ID
+	, a.CCBMATCH_ROUTER_DIALIN
+	, a.PARENT_ROUTERNAME
+,CASE
+    WHEN  a.SUBSCRIPTION_ID is not null THEN a.SUBSCRIPTION_ID
+        ELSE LPAD(a.SERVICE_SUBSCRIPTION,16,'0')
+END AS SERVICE_SUBSCRIPTION_ID,
+
+CASE
+    WHEN a.SUBSCRIPTION_ID is not null and a.SERVICE_SUBSCRIPTION is null THEN 'AIDA Router in CCB, AIDA SerSu nicht vorhanden'
+    WHEN a.SUBSCRIPTION_ID is not null and a.SERVICE_SUBSCRIPTION is not null THEN 'AIDA Router in CCB, AIDA SerSu vorhanden und nicht geprüft'
+    WHEN a.SUBSCRIPTION_ID is null and a.SERVICE_SUBSCRIPTION is null THEN 'AIDA Router nicht in CCB, AIDA SerSu nicht vorhanden'
+    WHEN a.SUBSCRIPTION_ID is null and a.SERVICE_SUBSCRIPTION is not null and ssu.SUBSCRIPTION_ID is null THEN 'AIDA Router nicht in CCB, AIDA SerSu vorhanden und nicht in CCB'
+    WHEN a.SUBSCRIPTION_ID is null and a.SERVICE_SUBSCRIPTION is not null and ssu.SUBSCRIPTION_ID is not null THEN 'AIDA Router nicht in CCB, AIDA SerSu vorhanden und in CCB'
+    ELSE 'Nicht definiert'
+END AS MERGE_STATUS,
+
+CASE
+    WHEN a.SERVICE_SUBSCRIPTION is not null THEN '1'
+    WHEN a.SERVICE_SUBSCRIPTION is null THEN '0'
+END AS MERGE_STATUS_AIDA_SERSU_VORHANDEN,
+
+CASE
+    WHEN a.SUBSCRIPTION_ID is not null and ssu.SERVICE_STATUS_CODE='SUBSCRIBED' THEN '1'
+    WHEN a.SUBSCRIPTION_ID is not null and ssu.SERVICE_STATUS_CODE<>'SUBSCRIBED' THEN '2'
+    WHEN a.SUBSCRIPTION_ID is null THEN '0'
+END AS MERGE_STATUS_AIDA_ROUTER_CCB,
+
+CASE
+	WHEN ssu.SUBSCRIPTION_ID is not null and a.SUBSCRIPTION_ID is null and ssu.SERVICE_STATUS_CODE='SUBSCRIBED' THEN '1'
+	WHEN ssu.SUBSCRIPTION_ID is not null and a.SUBSCRIPTION_ID is null and ssu.SERVICE_STATUS_CODE<>'SUBSCRIBED' THEN '2'
+	ELSE '0'
+
+END AS MERGE_STATUS_AIDA_SERSU_CCB,
+
+CASE
+	WHEN a.SUBSCRIPTION_ID is null and a.SERVICE_SUBSCRIPTION is null THEN '1'
+	WHEN a.SUBSCRIPTION_ID is null and a.SERVICE_SUBSCRIPTION is not null and ssu.SUBSCRIPTION_ID is null THEN '1'
+	ELSE '0'
+END as MERGE_STATUS_CCB_MERGE,
+
+current_timestamp as TS_AKTUALISIERT,
+current_timestamp as TS_INSERT,
+'AKT' as STATUS_COUNT
+
+FROM VT_PICASSO_AIDAROUTER_TMP a
+	left join (select SUBSCRIPTION_ID, PARENT_SUBSCRIPTION_ID, SERVICE_STATUS_CODE from BI_DATA.WLN_DV_SUBSCRIPTION_DERIVED union select SERVICE_SUBSCRIPTION_ID as SUBSCRIPTION_ID, SERVICE_SUBSCRIPTION_DEP as PARENT_SUBSCRIPTION_ID, SERVICE_SUBSCRIPTION_STATUS as SERVICE_STATUS_CODE from DWH_ARCORDWH_PRD.DT_SERVICE_NOT_FINAL) ssu
+		on CASE
+    WHEN  a.SUBSCRIPTION_ID is not null THEN a.SUBSCRIPTION_ID
+        ELSE LPAD(a.SERVICE_SUBSCRIPTION,16,'0')
+END = ssu.SUBSCRIPTION_ID
+
+) WITH DATA
+PRIMARY INDEX (SERVICE_SUBSCRIPTION_ID);
+
+
+
+-- PICASSO_AIDA_CCB_MATCH_TMP sind die Daten von heute
+-- UDB138.PICASSO_AIDA_CCB_MATCH sind die Daten von gestern
+-- PICASSO_AIDA_CCB_MATCH_ARCHIVE sind diejenigen, die gestern noch da waren, heute aber nicht mehr
+
+select current_timestamp(0), count(1) || ' records extracted to UDB138.PICASSO_AIDA_CCB_MATCH_TMP' from UDB138.PICASSO_AIDA_CCB_MATCH_TMP; 
+
+.set errorlevel 3807 severity 0
+drop table VT_PICASSO_AIDA_CCB_MATCH_ARCHIVE_part11;
+.set errorlevel 3807 severity 8
+
+
+create VOLATILE TABLE  VT_PICASSO_AIDA_CCB_MATCH_ARCHIVE_part1 AS
+(
+select 
+	routername, 
+	COALESCE(ROUTERNAME_CCB,'999') as ROUTERNAME_CCB,
+    COALESCE(SERVICE_SUBSCRIPTION_ID,'999') as SERVICE_SUBSCRIPTION_ID,
+	MERGE_STATUS_AIDA_SERSU_VORHANDEN ,
+	COALESCE(PARENT_ROUTERNAME,'999') as PARENT_ROUTERNAME
+from UDB138.PICASSO_AIDA_CCB_MATCH
+)
+WITH DATA
+--PRIMARY INDEX (SERVICE_SUBSCRIPTION_ID)
+ON COMMIT PRESERVE ROWS;
+
+
+.set errorlevel 3807 severity 0
+drop table VT_PICASSO_AIDA_CCB_MATCH_ARCHIVE_part2;
+.set errorlevel 3807 severity 8
+
+create VOLATILE TABLE  VT_PICASSO_AIDA_CCB_MATCH_ARCHIVE_part2 AS
+(
+select 
+	routername, 
+	COALESCE(ROUTERNAME_CCB,'999') as ROUTERNAME_CCB,
+    COALESCE(SERVICE_SUBSCRIPTION_ID,'999') as SERVICE_SUBSCRIPTION_ID,
+	MERGE_STATUS_AIDA_SERSU_VORHANDEN ,
+	COALESCE(PARENT_ROUTERNAME,'999') as PARENT_ROUTERNAME
+from UDB138.PICASSO_AIDA_CCB_MATCH_TMP
+)
+WITH DATA
+--PRIMARY INDEX (SERVICE_SUBSCRIPTION_ID)
+ON COMMIT PRESERVE ROWS;
+
+
+.set errorlevel 3807 severity 0
+drop table UDB138.PICASSO_AIDA_CCB_MATCH_ARCHIVE;
+.set errorlevel 3807 severity 8
+
+create Table UDB138.PICASSO_AIDA_CCB_MATCH_ARCHIVE as
+(
+select 
+	*
+from VT_PICASSO_AIDA_CCB_MATCH_ARCHIVE_part1
+minus
+select 
+	*
+from VT_PICASSO_AIDA_CCB_MATCH_ARCHIVE_part2
+)WITH DATA
+PRIMARY INDEX (SERVICE_SUBSCRIPTION_ID);
+
+
+ALTER TABLE UDB138.PICASSO_AIDA_CCB_MATCH_ARCHIVE ADD STATUS_COUNT VARCHAR(6) default 'HIS' ;
+
+.set errorlevel 3807 severity 0
+drop table VT_PICASSO_AIDA_CCB_MATCH_ARCHIVE_part1;
+drop table VT_PICASSO_AIDA_CCB_MATCH_ARCHIVE_part2;
+.set errorlevel 3807 severity 8
+
+
+insert into udb138.PICASSO_AIDA_CCB_MATCH_TMP
+select 
+  ol.ROUTERNAME	
+,ol.ROUTERNAME_CCB	
+,ol.SERVICE_SUBSCRIPTION_ID_CCB	
+,ol.PARENT_SERVICE_SUBSCRIPTION_ID	
+,ol.CCBMATCH_ROUTER_DIALIN
+,ol.PARENT_ROUTERNAME	
+,ol.SERVICE_SUBSCRIPTION_ID	
+,ol.MERGE_STATUS
+,ol.MERGE_STATUS_AIDA_SERSU_VORHANDEN	
+,ol.MERGE_STATUS_AIDA_ROUTER_CCB	
+,ol.MERGE_STATUS_AIDA_SERSU_CCB	
+,ol.MERGE_STATUS_CCB_MERGE	
+,coalesce(ol.TS_AKTUALISIERT, current_timestamp) as TS_AKTUALISIERT
+,ol.TS_INSERT
+,arc.STATUS_COUNT
+from UDB138.PICASSO_AIDA_CCB_MATCH_ARCHIVE arc
+inner join UDB138.PICASSO_AIDA_CCB_MATCH ol 
+on arc.ROUTERNAME = ol.ROUTERNAME
+AND COALESCE(arc.ROUTERNAME_CCB,'999') = COALESCE(ol.ROUTERNAME_CCB,'999')
+AND COALESCE(arc.SERVICE_SUBSCRIPTION_ID,'999') = COALESCE(ol.SERVICE_SUBSCRIPTION_ID,'999')
+and arc.MERGE_STATUS_AIDA_SERSU_VORHANDEN = ol.MERGE_STATUS_AIDA_SERSU_VORHANDEN
+and COALESCE(arc.PARENT_ROUTERNAME,'999') = COALESCE(ol.PARENT_ROUTERNAME,'999')
+;
+
+
+create Table UDB138.PICASSO_AIDA_CCB_MATCH_TMP2 as
+(
+select    
+	a.ROUTERNAME,
+    a.ROUTERNAME_CCB,
+    a.SERVICE_SUBSCRIPTION_ID_CCB,
+    a.PARENT_SERVICE_SUBSCRIPTION_ID,
+    a.CCBMATCH_ROUTER_DIALIN,
+	a.PARENT_ROUTERNAME,
+    a.SERVICE_SUBSCRIPTION_ID,
+    a.MERGE_STATUS,
+    a.MERGE_STATUS_AIDA_SERSU_VORHANDEN,
+    a.MERGE_STATUS_AIDA_ROUTER_CCB,
+    a.MERGE_STATUS_AIDA_SERSU_CCB,
+    a.MERGE_STATUS_CCB_MERGE,
+    coalesce(a.TS_AKTUALISIERT, current_timestamp) as TS_AKTUALISIERT,
+	coalesce(b.TS_INSERT, a.TS_AKTUALISIERT) as TS_INSERT,
+	a.STATUS_COUNT,
+	current_timestamp as LOADTM
+from UDB138.PICASSO_AIDA_CCB_MATCH_TMP a
+left join UDB138.PICASSO_AIDA_CCB_MATCH b
+on a.ROUTERNAME = b.ROUTERNAME
+AND COALESCE(a.ROUTERNAME_CCB,'999') = COALESCE(b.ROUTERNAME_CCB,'999')
+AND COALESCE(a.SERVICE_SUBSCRIPTION_ID,'999') = COALESCE(b.SERVICE_SUBSCRIPTION_ID,'999')
+and a.MERGE_STATUS_AIDA_SERSU_VORHANDEN = b.MERGE_STATUS_AIDA_SERSU_VORHANDEN
+and COALESCE(a.PARENT_ROUTERNAME,'999') = COALESCE(b.PARENT_ROUTERNAME,'999')
+)WITH DATA
+PRIMARY INDEX (SERVICE_SUBSCRIPTION_ID);
+
+
+UPDATE UDB138.PICASSO_AIDA_CCB_MATCH_TMP2
+SET STATUS_COUNT = 'NEU'
+WHERE TS_AKTUALISIERT = TS_INSERT
+and TS_AKTUALISIERT >= current_timestamp - interval '1' day;
+
+
+
+.set errorlevel 3807 severity 0
+drop table UDB138.PICASSO_AIDA_CCB_MATCH;
+.set errorlevel 3807 severity 8
+
+.set errorlevel 3807 severity 0
+drop table UDB138.PICASSO_AIDA_CCB_MATCH_TMP;
+.set errorlevel 3807 severity 8
+
+rename table UDB138.PICASSO_AIDA_CCB_MATCH_TMP2 to UDB138.PICASSO_AIDA_CCB_MATCH;
+
+.set errorlevel 3807 severity 0
+drop table VT_PICASSO_AIDAROUTER_TMP;
+.set errorlevel 3807 severity 8
+
+.set errorlevel 3807 severity 0
+drop table UDB138.PICASSO_AIDA_CCB_MATCH_ARCHIVE;
+.set errorlevel 3807 severity 8
+
+
+create VOLATILE TABLE VT_PICASSO_AIDA_CCB_MATCH_STATISTIK_ARCHIVE AS
+(
+select
+Distinct
+ARCHIVE_DATUM,
+ARCHIVE_STATUS_COUNT,
+ARCHIVE_COUNT_ROUTERNAME
+from UDB138.PICASSO_AIDA_CCB_MATCH_STATISTIK
+where ARCHIVE_DATUM <> Current_Date
+)
+WITH DATA
+ON COMMIT PRESERVE ROWS;
+
+
+.set errorlevel 3807 severity 0
+drop table UDB138.PICASSO_AIDA_CCB_MATCH_STATISTIK;
+.set errorlevel 3807 severity 8
+
+
+create table UDB138.PICASSO_AIDA_CCB_MATCH_STATISTIK as (
+select
+Current_Date as ARCHIVE_DATUM,
+STATUS_COUNT as ARCHIVE_STATUS_COUNT,
+sum(COUNT_ROUTERNAME_SERSU) as ARCHIVE_COUNT_ROUTERNAME
+from 
+(
+select ROUTERNAME,
+SERVICE_SUBSCRIPTION_ID,
+STATUS_COUNT,
+count(distinct ROUTERNAME) as COUNT_ROUTERNAME_SERSU
+from UDB138.PICASSO_AIDA_CCB_MATCH
+group by ROUTERNAME,SERVICE_SUBSCRIPTION_ID,STATUS_COUNT
+) temp_table
+group by STATUS_COUNT
+)
+WITH DATA
+PRIMARY INDEX (ARCHIVE_DATUM);
+
+
+insert into udb138.PICASSO_AIDA_CCB_MATCH_STATISTIK
+select
+Distinct
+ARCHIVE_DATUM,
+ARCHIVE_STATUS_COUNT,
+ARCHIVE_COUNT_ROUTERNAME
+from VT_PICASSO_AIDA_CCB_MATCH_STATISTIK_ARCHIVE;
+
+
+.set errorlevel 3807 severity 0
+drop table VT_PICASSO_AIDA_CCB_MATCH_STATISTIK_ARCHIVE;
+.set errorlevel 3807 severity 8
+
+
+--.set errorlevel 3807 severity 8
+
+
+select current_timestamp(0), 'End PICASSO_AIDA_CCB_MATCH.sql';
+
+
+.logoff;
+.quit;
